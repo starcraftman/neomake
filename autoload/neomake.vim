@@ -167,7 +167,7 @@ function! neomake#GetEnabledMakers(...) abort
 endfunction
 
 function! neomake#Make(options) abort
-    call neomake#utils#DefineSigns()
+    call neomake#signs#DefineSigns()
 
     let ft = get(a:options, 'ft', '')
     let file_mode = get(a:options, 'file_mode')
@@ -191,12 +191,7 @@ function! neomake#Make(options) abort
     if file_mode
         let b:neomake_loclist_nr = 0
         let b:neomake_errors = {}
-        " Remove any signs we placed before
-        let b:neomake_signs = get(b:, 'neomake_signs', {})
-        for ln in keys(b:neomake_signs)
-            exe 'sign unplace '.b:neomake_signs[ln]
-        endfor
-        let b:neomake_signs = {}
+        call neomake#signs#CleanBuffer()
     endif
 
     let serialize = get(g:, 'neomake_serialize')
@@ -235,51 +230,6 @@ function! neomake#Make(options) abort
     endfor
 endfunction
 
-function! neomake#GetSigns(...) abort
-    let signs = {
-        \ 'by_line': {},
-        \ 'max_id': 0,
-        \ }
-    if a:0
-        let opts = a:1
-    else
-        let opts = {}
-    endif
-    let place_cmd = 'sign place'
-    for attr in keys(opts)
-        if attr ==# 'file' || attr ==# 'buffer'
-            let place_cmd .= ' '.attr.'='.opts[attr]
-        endif
-    endfor
-    call neomake#utils#DebugMessage('executing: '.place_cmd)
-    redir => signs_txt | silent exe place_cmd | redir END
-    let fname_pattern = 'Signs for \(.*\):'
-    for s in split(signs_txt, '\n')
-        if s =~# fname_pattern
-            " This should always happen first, so don't define outside loop
-            let fname = substitute(s, fname_pattern, '\1', '')
-        elseif s =~# 'id='
-            let result = {}
-            let parts = split(s, '\s\+')
-            for part in parts
-                let [key, val] = split(part, '=')
-                let result[key] = val =~# '\d\+' ? 0 + val : val
-            endfor
-            let result.file = fname
-            if !has_key(opts, 'name') || opts.name ==# result.name
-                let signs.by_line[result.line] = get(signs.by_line, result.line, [])
-                call add(signs.by_line[result.line], result)
-                let signs.max_id = max([signs.max_id, result.id])
-            endif
-        endif
-    endfor
-    return signs
-endfunction
-
-function! neomake#GetSignsInBuffer(bufnr) abort
-    return neomake#GetSigns({'buffer': a:bufnr})
-endfunction
-
 function! s:AddExprCallback(maker) abort
     let file_mode = get(a:maker, 'file_mode')
     let place_signs = get(g:, 'neomake_place_signs', 1)
@@ -305,31 +255,10 @@ function! s:AddExprCallback(maker) abort
 
             if place_signs
                 if !exists('l:signs')
-                    let l:signs = neomake#GetSignsInBuffer(entry.bufnr)
-                    let sign_id = l:signs.max_id + 1
+                    let l:signs = neomake#signs#GetSignsInBuffer(entry.bufnr)
                 endif
-                let s = sign_id
-                let sign_id += 1
-                let type = entry.type ==# 'E' ? 'neomake_err' : 'neomake_warn'
-
-                let l:signs.by_line[entry.lnum] = get(l:signs.by_line, entry.lnum, [])
-                if !has_key(b:neomake_signs, entry.lnum)
-                    exe 'sign place '.s.' line='.entry.lnum.' name='.type.' buffer='.entry.bufnr
-                    let b:neomake_signs[entry.lnum] = s
-                elseif type ==# 'neomake_err'
-                    " Upgrade this sign to an error
-                    exe 'sign place '.b:neomake_signs[entry.lnum].' name='.type.' buffer='.entry.bufnr
-                endif
+                call neomake#signs#PlaceSign(l:signs, entry)
                 let placed_sign = 1
-
-                " Replace all existing signs for this line, so that ours appears
-                " on top
-                for existing in get(l:signs.by_line, entry.lnum, [])
-                    if existing.name !~# 'neomake_'
-                        exe 'sign unplace '.existing.id.' buffer='.entry.bufnr
-                        exe 'sign place '.existing.id.' line='.existing.line.' name='.existing.name.' buffer='.entry.bufnr
-                    endif
-                endfor
             endif
         endwhile
         if placed_sign
