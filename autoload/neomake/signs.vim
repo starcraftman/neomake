@@ -1,12 +1,14 @@
 " vim: ts=4 sw=4 et
 
-function! neomake#signs#CleanBuffer() abort
-    let b:neomake_signs = get(b:, 'neomake_signs', {})
-    for ln in keys(b:neomake_signs)
-        exe 'sign unplace '.b:neomake_signs[ln]
-    endfor
-    let b:neomake_signs = {}
+function! neomake#signs#Reset() abort
+    let s:sign_queue = {}
+    if exists('s:last_placed_signs')
+        call neomake#signs#CleanOldSigns()
+    endif
+    let s:last_placed_signs = get(s:, 'placed_signs', {})
+    let s:placed_signs = {}
 endfunction
+call neomake#signs#Reset()
 
 function! neomake#signs#GetSigns(...) abort
     let signs = {
@@ -53,30 +55,72 @@ function! neomake#signs#GetSignsInBuffer(bufnr) abort
     return neomake#signs#GetSigns({'buffer': a:bufnr})
 endfunction
 
+function! neomake#signs#RegisterSign(entry) abort
+    let s:sign_queue[a:entry.bufnr] = get(s:sign_queue, a:entry.bufnr, {})
+    let existing = get(s:sign_queue[a:entry.bufnr], a:entry.lnum, {})
+    if empty(existing) || a:entry.type ==# 'E' && existing.type !=# 'E'
+        let s:sign_queue[a:entry.bufnr][a:entry.lnum] = a:entry
+    endif
+endfunction
+
 function! neomake#signs#PlaceSign(existing_signs, entry) abort
     let type = a:entry.type ==# 'E' ? 'neomake_err' : 'neomake_warn'
 
-    let a:existing_signs.by_line[a:entry.lnum] = get(l:signs.by_line, a:entry.lnum, [])
-    if !has_key(b:neomake_signs, a:entry.lnum)
+    let a:existing_signs.by_line[a:entry.lnum] = get(a:existing_signs.by_line,
+                                                   \ a:entry.lnum, [])
+    let s:placed_signs[a:entry.bufnr] = get(s:placed_signs, a:entry.bufnr, {})
+    if !has_key(s:placed_signs[a:entry.bufnr], a:entry.lnum)
         let sign_id = a:existing_signs.max_id + 1
         let a:existing_signs.max_id = sign_id
-        exe 'sign place '.sign_id.' line='.a:entry.lnum.
-                                \ ' name='.type.
-                                \ ' buffer='.a:entry.bufnr
-        let b:neomake_signs[a:entry.lnum] = sign_id
+        let cmd = 'sign place '.sign_id.' line='.a:entry.lnum.
+                                      \ ' name='.type.
+                                      \ ' buffer='.a:entry.bufnr
+        let s:placed_signs[a:entry.bufnr][a:entry.lnum] = sign_id
     elseif type ==# 'neomake_err'
         " Upgrade this sign to an error
-        exe 'sign place '.b:neomake_signs[a:entry.lnum].' name='.type.
-                                                      \ ' buffer='.a:entry.bufnr
+        let sign_id = s:placed_signs[a:entry.bufnr][a:entry.lnum]
+        let cmd =  'sign place '.sign_id.' name='.type.' buffer='.a:entry.bufnr
     endif
+    call neomake#utils#DebugMessage('Placing sign: '.cmd)
+    exe cmd
 
     " Replace all existing signs for this line, so that ours appear on top
-    for existing in get(l:signs.by_line, a:entry.lnum, [])
+    for existing in get(a:existing_signs.by_line, a:entry.lnum, [])
         if existing.name !~# 'neomake_'
             exe 'sign unplace '.existing.id.' buffer='.a:entry.bufnr
             exe 'sign place '.existing.id.' line='.existing.line.
                                         \ ' name='.existing.name.
                                         \ ' buffer='.a:entry.bufnr
+        endif
+    endfor
+endfunction
+
+function! neomake#signs#CleanOldSigns() abort
+    call neomake#utils#DebugObject('Cleaning old signs:', s:last_placed_signs)
+    for buf in keys(s:last_placed_signs)
+        for ln in keys(s:last_placed_signs[buf])
+            let cmd = 'sign unplace '.s:last_placed_signs[buf][ln]
+            call neomake#utils#DebugMessage('Unplacing sign: '.cmd)
+            exe cmd
+        endfor
+    endfor
+    let s:last_placed_signs = {}
+endfunction
+
+function! neomake#signs#PlaceVisibleSigns() abort
+    let buf = bufnr('%')
+    if !has_key(s:sign_queue, buf)
+        return
+    endif
+    let topline = line('w0')
+    let botline = line('w$')
+    for ln in range(topline, botline)
+        if has_key(s:sign_queue[buf], ln)
+            if !exists('l:signs')
+                let l:signs = neomake#signs#GetSignsInBuffer(buf)
+            endif
+            call neomake#signs#PlaceSign(l:signs, s:sign_queue[buf][ln])
+            unlet s:sign_queue[buf][ln]
         endif
     endfor
 endfunction

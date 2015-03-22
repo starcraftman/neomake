@@ -132,6 +132,8 @@ function! neomake#GetMaker(name, makepath, ...) abort
     endif
     let maker.name = a:name
     let maker.ft = ft
+    " Only relevant if file_mode is used
+    let maker.winnr = winnr()
     return maker
 endfunction
 
@@ -166,7 +168,10 @@ function! neomake#GetEnabledMakers(...) abort
     return enabled_makers
 endfunction
 
-function! neomake#Make(options) abort
+function! neomake#Make(options, ...) abort
+    " It is a continuation if it is a subsequent maker and we are in serialize
+    " mode
+    let continuation = a:0 && a:1
     call neomake#signs#DefineSigns()
 
     let ft = get(a:options, 'ft', '')
@@ -188,10 +193,11 @@ function! neomake#Make(options) abort
         cgetexpr ''
     endif
 
-    if file_mode
-        let b:neomake_loclist_nr = 0
-        let b:neomake_errors = {}
-        call neomake#signs#CleanBuffer()
+    if !continuation
+        " Only do this if we have one or more enabled makers
+        call neomake#signs#Reset()
+        let s:neomake_list_nr = 0
+        let s:cleared_current_errors = 0
     endif
 
     let serialize = get(g:, 'neomake_serialize')
@@ -205,8 +211,9 @@ function! neomake#Make(options) abort
                 let tempfile = 1
                 let tempsuffix = '.'.neomake#utils#Random().'.neomake.tmp'
                 let makepath .= tempsuffix
-                " TODO Make this cross platform
-                silent exe 'w !cat > '.shellescape(makepath)
+                let escapedpath = fnameescape(makepath)
+                noautocmd silent exe 'keepalt w! '.escapedpath
+                noautocmd silent exe 'bwipeout '.escapedpath
                 call neomake#utils#LoudMessage('Neomake: wrote temp file '.makepath)
             endif
         endif
@@ -233,38 +240,33 @@ endfunction
 function! s:AddExprCallback(maker) abort
     let file_mode = get(a:maker, 'file_mode')
     let place_signs = get(g:, 'neomake_place_signs', 1)
-    if file_mode
-        let loclist = getloclist(0)
+    let list = file_mode ? getloclist(a:maker.winnr) : getqflist()
 
-        let sign_id = 1
-        let placed_sign = 0
-        while b:neomake_loclist_nr < len(loclist)
-            let entry = loclist[b:neomake_loclist_nr]
-            let b:neomake_loclist_nr += 1
+    while s:neomake_list_nr < len(list)
+        let entry = list[s:neomake_list_nr]
+        let s:neomake_list_nr += 1
 
-            if !entry.bufnr
-                continue
-            endif
-            if !entry.valid
-                continue
-            endif
-
-            " Track all errors by line
-            let b:neomake_errors[entry.lnum] = get(b:neomake_errors, entry.lnum, [])
-            call add(b:neomake_errors[entry.lnum], entry)
-
-            if place_signs
-                if !exists('l:signs')
-                    let l:signs = neomake#signs#GetSignsInBuffer(entry.bufnr)
-                endif
-                call neomake#signs#PlaceSign(l:signs, entry)
-                let placed_sign = 1
-            endif
-        endwhile
-        if placed_sign
-            redraw!
+        if !entry.bufnr
+            continue
         endif
-    endif
+        if !entry.valid
+            continue
+        endif
+
+        " On the first valid error identified by a maker,
+        " clear the existing signs in the buffer
+        call s:CleanSignsAndErrors()
+
+        " Track all errors by buffer and line
+        let s:current_errors[entry.bufnr] = get(s:current_errors, entry.bufnr, {})
+        let s:current_errors[entry.bufnr][entry.lnum] = get(
+            \ s:current_errors[entry.bufnr], entry.lnum, [])
+        call add(s:current_errors[entry.bufnr][entry.lnum], entry)
+
+        if place_signs
+            call neomake#signs#RegisterSign(entry)
+        endif
+    endwhile
 endfunction
 
 function! s:CleanJobinfo(jobinfo) abort
@@ -312,6 +314,7 @@ function! neomake#ProcessCurrentBuffer() abort
         endfor
         unlet s:job_output_by_buffer[buf]
     endif
+    call neomake#signs#PlaceVisibleSigns()
 endfunction
 
 function! s:RegisterJobOutput(jobinfo, maker, lines) abort
@@ -395,10 +398,11 @@ function! neomake#MakeHandler(...) abort
         " TODO This used to open up as the list was populated, but it caused
         " some issues with s:AddExprCallback.
         if get(g:, 'neomake_open_list')
+            let height = get(g:, 'neomake_list_height', 10)
             if get(maker, 'file_mode')
-                lwindow
+                exe "lwindow ".height
             else
-                cwindow
+                exe "cwindow ".height
             endif
         endif
         let status = get(job_data, 2, 0)
@@ -413,6 +417,11 @@ function! neomake#MakeHandler(...) abort
         else
             call neomake#utils#QuietMessage(msg)
         endif
+
+        " If signs were not cleared before this point, then the maker did not return
+        " any errors, so all signs must be removed
+        call s:CleanSignsAndErrors()
+
         " Show the current line's error
         call neomake#CursorMoved()
 
@@ -422,39 +431,54 @@ function! neomake#MakeHandler(...) abort
                 call neomake#utils#LoudMessage('Aborting next makers '.next_makers)
             else
                 call neomake#utils#DebugMessage('next makers '.next_makers)
-                call neomake#Make(maker.next)
+                call neomake#Make(maker.next, 1)
             endif
         endif
     endif
 endfunction
 
-function! neomake#CursorMoved() abort
+function! s:CleanSignsAndErrors()
+    call neomake#signs#CleanOldSigns()
+    if !s:cleared_current_errors
+        let s:current_errors = {}
+        let s:cleared_current_errors = 1
+    endif
+endfunction
+
+function! neomake#EchoCurrentError() abort
     if !get(g:, 'neomake_echo_current_error', 1)
         return
     endif
 
-    if !empty(get(b:, 'neomake_last_echoed_error', {}))
-        unlet b:neomake_last_echoed_error
+    if !empty(get(s:, 'neomake_last_echoed_error', {}))
+        unlet s:neomake_last_echoed_error
         echon ''
     endif
 
-    let errors = get(b:, 'neomake_errors', {})
+    let errors = get(s:, 'current_errors', {})
     if empty(errors)
         return
     endif
 
+    let buf = bufnr('%')
+    let buf_errors = get(errors, buf, {})
     let ln = line('.')
-    let ln_errors = get(errors, ln, [])
+    let ln_errors = get(buf_errors, ln, [])
     if empty(ln_errors)
         return
     endif
 
-    let b:neomake_last_echoed_error = ln_errors[0]
+    let s:neomake_last_echoed_error = ln_errors[0]
     for error in ln_errors
         if error.type ==# 'E'
-            let b:neomake_last_echoed_error = error
+            let s:neomake_last_echoed_error = error
             break
         endif
     endfor
-    call neomake#utils#WideMessage(b:neomake_last_echoed_error.text)
+    call neomake#utils#WideMessage(s:neomake_last_echoed_error.text)
+endfunction
+
+function! neomake#CursorMoved() abort
+    call neomake#signs#PlaceVisibleSigns()
+    call neomake#EchoCurrentError()
 endfunction
